@@ -111,8 +111,9 @@ func buildPlanCmd() *cobra.Command {
 type (
 	// parsePlanOptionsFlags stores the flags that are parsed into planOptions.
 	planOptionsFlags struct {
-		includeSchemas []string
-		excludeSchemas []string
+		includeSchemas     []string
+		excludeSchemas     []string
+		excludeNameRegexes []string
 
 		dataPackNewTables     bool
 		disablePlanValidation bool
@@ -221,6 +222,10 @@ func createPlanOptionsFlags(cmd *cobra.Command) *planOptionsFlags {
 
 	cmd.Flags().StringArrayVar(&flags.includeSchemas, "include-schema", nil, "Include the specified schema in the plan")
 	cmd.Flags().StringArrayVar(&flags.excludeSchemas, "exclude-schema", nil, "Exclude the specified schema in the plan")
+	cmd.Flags().StringArrayVar(&flags.excludeNameRegexes, "exclude-name-regex", nil,
+		"Regex (Go RE2) matched against each object's fully-qualified name (schema.unescaped-name). "+
+			"Any object that matches is excluded from the plan. May be specified multiple times. "+
+			"Useful for runtime-rotated tables (e.g., pg_partman daily children: --exclude-name-regex '_p[0-9]+(_|$)').")
 
 	cmd.Flags().BoolVar(&flags.dataPackNewTables, "data-pack-new-tables", true, "If set, will data pack new tables in the plan to minimize table size (re-arranges columns).")
 	cmd.Flags().BoolVar(&flags.disablePlanValidation, "disable-plan-validation", false, "If set, will disable plan validation. Plan validation runs the migration against a temporary"+
@@ -315,9 +320,19 @@ func dsnSchemaSource(connConfig *pgx.ConnConfig) schemaSourceFactory {
 }
 
 func parsePlanOptions(p planOptionsFlags) (planOptions, error) {
+	excludeNameRegexes := make([]*regexp.Regexp, 0, len(p.excludeNameRegexes))
+	for _, raw := range p.excludeNameRegexes {
+		re, err := regexp.Compile(raw)
+		if err != nil {
+			return planOptions{}, fmt.Errorf("compiling --exclude-name-regex %q: %w", raw, err)
+		}
+		excludeNameRegexes = append(excludeNameRegexes, re)
+	}
+
 	opts := []diff.PlanOpt{
 		diff.WithIncludeSchemas(p.includeSchemas...),
 		diff.WithExcludeSchemas(p.excludeSchemas...),
+		diff.WithExcludeNameRegexes(excludeNameRegexes...),
 	}
 
 	if p.dataPackNewTables {

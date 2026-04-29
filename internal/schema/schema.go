@@ -566,6 +566,24 @@ func WithExcludeSchemas(schemas ...string) GetSchemaOpt {
 	}
 }
 
+// WithExcludeNameRegexes filters the schema to exclude any object whose fully-qualified name (schema.name) matches
+// any of the supplied regexes. The match is performed against the unescaped name, so callers should write patterns
+// in their natural form ("webhook_events_p[0-9]+", not "\"webhook_events_p[0-9]+\""). Compounds with WithExcludeSchemas:
+// an object is excluded if it falls in an excluded schema OR matches any exclude-name regex.
+//
+// The primary use case is partman-style runtime-rotated child tables — partman creates a new daily partition every
+// day, and pg-schema-diff sees them in the live database but not in the source DDL, so without filtering it would
+// emit DROPs every plan run. Pattern `_p[0-9]+(_|$)` covers both the children themselves and their auto-named
+// constraints/indexes.
+//
+// Like WithExcludeSchemas, this does not validate that excluded objects are not referenced by included objects;
+// users are responsible for ensuring excluded objects don't break dependency closure of the diff.
+func WithExcludeNameRegexes(regexes ...*regexp.Regexp) GetSchemaOpt {
+	return func(o *getSchemaOptions) {
+		o.excludeNameRegexes = append(o.excludeNameRegexes, regexes...)
+	}
+}
+
 type getSchemaOptions struct {
 	// includeSchemas is a list of schemas to include in the schema. If empty, then all schemas are included.
 	// We could have built a more complex set of options using the nameFilter system (nested unions and intersections);
@@ -573,6 +591,8 @@ type getSchemaOptions struct {
 	includeSchemas []string
 	// excludeSchemas is the exclude analog of includeSchemas.
 	excludeSchemas []string
+	// excludeNameRegexes filters out objects whose fully-qualified name matches any of the regexes.
+	excludeNameRegexes []*regexp.Regexp
 }
 
 // GetSchema fetches the database schema. It is a non-atomic operation.
@@ -613,7 +633,22 @@ func buildNameFilter(options getSchemaOptions) (nameFilter, error) {
 
 	includeSchemasFilter := buildIncludeSchemasFilter(options.includeSchemas)
 	excludeSchemasFilter := buildExcludeSchemasFilter(options.excludeSchemas)
-	return andNameFilter(includeSchemasFilter, excludeSchemasFilter), nil
+	excludeNameRegexesFilter := buildExcludeNameRegexesFilter(options.excludeNameRegexes)
+	return andNameFilter(includeSchemasFilter, excludeSchemasFilter, excludeNameRegexesFilter), nil
+}
+
+func buildExcludeNameRegexesFilter(regexes []*regexp.Regexp) nameFilter {
+	if len(regexes) == 0 {
+		return func(name SchemaQualifiedName) bool {
+			return true
+		}
+	}
+
+	var filters []nameFilter
+	for _, re := range regexes {
+		filters = append(filters, notNameRegexFilter(re))
+	}
+	return andNameFilter(filters...)
 }
 
 func intersect(a, b []string) []string {
