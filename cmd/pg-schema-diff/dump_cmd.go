@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v4"
@@ -23,8 +24,13 @@ func buildDumpCmd() *cobra.Command {
 
 	var includeSchemas []string
 	var excludeSchemas []string
+	var excludeNameRegexes []string
 	cmd.Flags().StringArrayVar(&includeSchemas, "include-schema", nil, "Include the specified schema in the dump")
 	cmd.Flags().StringArrayVar(&excludeSchemas, "exclude-schema", nil, "Exclude the specified schema from the dump")
+	cmd.Flags().StringArrayVar(&excludeNameRegexes, "exclude-name-regex", nil,
+		"Regex (Go RE2) matched against each object's fully-qualified name (schema.unescaped-name). "+
+			"Any object that matches is excluded from the dump. May be specified multiple times. "+
+			"Useful for runtime-rotated tables (e.g., pg_partman daily children: --exclude-name-regex '_p[0-9]+(_|$)').")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		connConfig, err := parseConnectionFlags(connFlags)
@@ -34,10 +40,16 @@ func buildDumpCmd() *cobra.Command {
 
 		cmd.SilenceUsage = true
 
+		compiledRegexes, err := compileExcludeNameRegexes(excludeNameRegexes)
+		if err != nil {
+			return err
+		}
+
 		plan, err := generateDump(cmd.Context(), generateDumpParams{
-			connConfig:     connConfig,
-			includeSchemas: includeSchemas,
-			excludeSchemas: excludeSchemas,
+			connConfig:         connConfig,
+			includeSchemas:     includeSchemas,
+			excludeSchemas:     excludeSchemas,
+			excludeNameRegexes: compiledRegexes,
 		})
 		if err != nil {
 			return err
@@ -51,9 +63,10 @@ func buildDumpCmd() *cobra.Command {
 }
 
 type generateDumpParams struct {
-	connConfig     *pgx.ConnConfig
-	includeSchemas []string
-	excludeSchemas []string
+	connConfig         *pgx.ConnConfig
+	includeSchemas     []string
+	excludeSchemas     []string
+	excludeNameRegexes []*regexp.Regexp
 }
 
 func generateDump(ctx context.Context, params generateDumpParams) (diff.Plan, error) {
@@ -82,6 +95,7 @@ func generateDump(ctx context.Context, params generateDumpParams) (diff.Plan, er
 		diff.WithTempDbFactory(tempDbFactory),
 		diff.WithIncludeSchemas(params.includeSchemas...),
 		diff.WithExcludeSchemas(params.excludeSchemas...),
+		diff.WithExcludeNameRegexes(params.excludeNameRegexes...),
 		diff.WithDoNotValidatePlan(),
 		diff.WithNoConcurrentIndexOps(),
 	)
