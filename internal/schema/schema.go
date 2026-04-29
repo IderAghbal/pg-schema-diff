@@ -449,6 +449,13 @@ type Function struct {
 	// can track the dependencies of the function (or not)
 	Language           string
 	DependsOnFunctions []SchemaQualifiedName
+	// HasUserDeclaredTrackability is true if the function body contains a pg-schema-diff
+	// directive that opts the function out of the HAS_UNTRACKABLE_DEPENDENCIES hazard
+	// (either `-- pg-schema-diff: no-untrackable-deps` or `-- pg-schema-diff: depends-on=...`).
+	// Functions in non-sql languages are otherwise marked untrackable because their bodies
+	// are opaque to the diff tool; this field records the function author's explicit
+	// assertion that the function's dependencies are accounted for.
+	HasUserDeclaredTrackability bool
 }
 
 type Procedure struct {
@@ -1320,12 +1327,58 @@ func (s *schemaFetcher) buildFunction(ctx context.Context, rawFunction queries.G
 		return Function{}, fmt.Errorf("fetchDependsOnFunctions(%s): %w", rawFunction.Oid, err)
 	}
 
+	hasDirective := hasFunctionTrackabilityDirective(rawFunction.FuncDef)
+
 	return Function{
-		SchemaQualifiedName: buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
-		FunctionDef:         rawFunction.FuncDef,
-		Language:            rawFunction.FuncLang,
-		DependsOnFunctions:  dependsOnFunctions,
+		SchemaQualifiedName:         buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
+		FunctionDef:                 rawFunction.FuncDef,
+		Language:                    rawFunction.FuncLang,
+		DependsOnFunctions:          dependsOnFunctions,
+		HasUserDeclaredTrackability: hasDirective,
 	}, nil
+}
+
+// pgSchemaDiffDirectiveRegex matches a single line containing a pg-schema-diff directive comment
+// inside a function body. The directive form recognized today is:
+//
+//	-- pg-schema-diff: no-untrackable-deps
+//
+// The directive must appear inside the function body (between the $$ ... $$ markers in the
+// CREATE statement) because pg_get_functiondef re-emits the function in canonical form and drops
+// comments outside the body.
+//
+// Match is case-insensitive (`(?i)`) so authors can use whatever capitalization their SQL style
+// guide prefers (`-- PG-SCHEMA-DIFF: NO-UNTRACKABLE-DEPS` is equivalent to lower-case).
+//
+// A future revision may add `depends-on=schema.fn(argtypes)` for explicit dep declaration so
+// pg-schema-diff can order a CREATE-after-CREATE chain correctly. That extension needs to mirror
+// pg_proc's name-plus-argtypes format (functions can be overloaded), which is more involved than
+// the no-untrackable-deps opt-out covered here.
+var pgSchemaDiffDirectiveRegex = regexp.MustCompile(`(?im)^\s*--\s*pg-schema-diff:\s*(.+?)\s*$`)
+
+// hasFunctionTrackabilityDirective scans a pg_get_functiondef body for any recognized
+// pg-schema-diff directive. A return of true marks the function as trackable
+// (HAS_UNTRACKABLE_DEPENDENCIES is suppressed) regardless of language — the author has asserted
+// that whatever dependencies exist are accounted for outside the diff tool's view.
+//
+// Unrecognized directive bodies are silently ignored so older tool versions reading schemas
+// authored against newer directives don't break; the trackability flag is still flipped so the
+// directive intent is honored at the level the older tool understands.
+func hasFunctionTrackabilityDirective(funcDef string) bool {
+	matches := pgSchemaDiffDirectiveRegex.FindAllStringSubmatch(funcDef, -1)
+	for _, m := range matches {
+		// Lower-case the body so the comparison below is case-insensitive in the same way
+		// the regex itself is. The regex's (?i) handles the prefix; this handles the body.
+		body := strings.ToLower(strings.TrimSpace(m[1]))
+		if body == "no-untrackable-deps" {
+			return true
+		}
+		// Unknown directive — recognized as a directive (so trackability is asserted) but
+		// otherwise ignored. Future versions can add new directive forms without churning
+		// schemas authored against this version.
+		return true
+	}
+	return false
 }
 
 func (s *schemaFetcher) fetchDependsOnFunctions(ctx context.Context, systemCatalog string, oid any) ([]SchemaQualifiedName, error) {
