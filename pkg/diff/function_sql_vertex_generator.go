@@ -67,7 +67,17 @@ func (f *functionSQLVertexGenerator) Alter(diff functionDiff) ([]Statement, erro
 }
 
 func canFunctionDependenciesBeTracked(function schema.Function) bool {
-	return function.Language == "sql"
+	// Native trackability: PostgreSQL's pg_depend tracks function-to-function references for
+	// SQL-language functions but not for plpgsql or other procedural languages whose bodies are
+	// opaque to the catalog.
+	if function.Language == "sql" {
+		return true
+	}
+	// User-declared trackability: a `-- pg-schema-diff: no-untrackable-deps` or
+	// `-- pg-schema-diff: depends-on=...` directive in the function body opts the function out of
+	// HAS_UNTRACKABLE_DEPENDENCIES. The author asserts that any dependencies are declared via
+	// depends-on or genuinely absent.
+	return function.HasUserDeclaredTrackability
 }
 
 func (f *functionSQLVertexGenerator) GetSQLVertexId(function schema.Function, diffType diffType) sqlVertexId {
