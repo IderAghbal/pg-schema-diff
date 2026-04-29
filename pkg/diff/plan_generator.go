@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -87,6 +88,15 @@ func WithIncludeSchemas(schemas ...string) PlanOpt {
 func WithExcludeSchemas(schemas ...string) PlanOpt {
 	return func(opts *planOptions) {
 		opts.getSchemaOpts = append(opts.getSchemaOpts, schema.WithExcludeSchemas(schemas...))
+	}
+}
+
+// WithExcludeNameRegexes filters the schema to exclude any object whose fully-qualified name (schema.name)
+// matches any of the supplied regexes. Compounds with WithExcludeSchemas. See schema.WithExcludeNameRegexes
+// for matching semantics and use-case discussion (partman-style rotated child tables).
+func WithExcludeNameRegexes(regexes ...*regexp.Regexp) PlanOpt {
+	return func(opts *planOptions) {
+		opts.getSchemaOpts = append(opts.getSchemaOpts, schema.WithExcludeNameRegexes(regexes...))
 	}
 }
 
