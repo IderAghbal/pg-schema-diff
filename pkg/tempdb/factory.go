@@ -58,13 +58,14 @@ type (
 )
 type (
 	onInstanceFactoryOptions struct {
-		dbPrefix       string
-		metadataSchema string
-		metadataTable  string
-		logger         log.Logger
-		rootDatabase   string
-		dropTimeout    time.Duration
-		randReader     io.Reader
+		dbPrefix         string
+		metadataSchema   string
+		metadataTable    string
+		logger           log.Logger
+		rootDatabase     string
+		dropTimeout      time.Duration
+		statementTimeout time.Duration
+		randReader       io.Reader
 	}
 
 	OnInstanceFactoryOpt func(*onInstanceFactoryOptions)
@@ -112,6 +113,21 @@ func WithDropTimeout(d time.Duration) OnInstanceFactoryOpt {
 	}
 }
 
+// WithStatementTimeout sets the statement_timeout applied to every
+// connection the factory opens — including the root connection that
+// runs CREATE DATABASE for the temporary database. Postgres
+// serializes CREATE DATABASE cluster-wide, so when several
+// pg-schema-diff invocations run concurrently against the same
+// cluster, later CREATE DATABASE calls block on the lock and can
+// exceed DefaultStatementTimeout (3s). Bumping this avoids spurious
+// "canceling statement due to statement timeout" errors in
+// high-concurrency setups (CI matrices, parallel `moon ci`, etc.).
+func WithStatementTimeout(d time.Duration) OnInstanceFactoryOpt {
+	return func(opts *onInstanceFactoryOptions) {
+		opts.statementTimeout = d
+	}
+}
+
 // WithRandReader seeds the random used to generate random SQL identifiers.
 func WithRandReader(randReader io.Reader) OnInstanceFactoryOpt {
 	return func(options *onInstanceFactoryOptions) {
@@ -143,13 +159,14 @@ type (
 // when the temporary database was created, e.g., to create a TTL
 func NewOnInstanceFactory(ctx context.Context, createConnPoolForDb CreateConnPoolForDbFn, opts ...OnInstanceFactoryOpt) (_ Factory, _retErr error) {
 	options := onInstanceFactoryOptions{
-		dbPrefix:       DefaultOnInstanceDbPrefix,
-		metadataSchema: DefaultOnInstanceMetadataSchema,
-		metadataTable:  DefaultOnInstanceMetadataTable,
-		dropTimeout:    DefaultStatementTimeout,
-		rootDatabase:   "postgres",
-		logger:         log.SimpleLogger(),
-		randReader:     rand.Reader,
+		dbPrefix:         DefaultOnInstanceDbPrefix,
+		metadataSchema:   DefaultOnInstanceMetadataSchema,
+		metadataTable:    DefaultOnInstanceMetadataTable,
+		dropTimeout:      DefaultStatementTimeout,
+		statementTimeout: DefaultStatementTimeout,
+		rootDatabase:     "postgres",
+		logger:           log.SimpleLogger(),
+		randReader:       rand.Reader,
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -166,7 +183,7 @@ func NewOnInstanceFactory(ctx context.Context, createConnPoolForDb CreateConnPoo
 		_ = rootDb.Close()
 	})
 
-	if err := assertConnPoolIsOnExpectedDatabase(ctx, rootDb, options.rootDatabase); err != nil {
+	if err := assertConnPoolIsOnExpectedDatabase(ctx, rootDb, options.rootDatabase, options.statementTimeout); err != nil {
 		return &onInstanceFactory{}, fmt.Errorf("assertConnPoolIsOnExpectedDatabase: %w", err)
 	}
 
@@ -187,7 +204,7 @@ func (o *onInstanceFactory) Create(ctx context.Context) (_ *Database, _retErr er
 		return nil, fmt.Errorf("creating uuid: %w", err)
 	}
 
-	rootConn, err := openConnectionWithDefaults(ctx, o.rootDb)
+	rootConn, err := openConnectionWithDefaults(ctx, o.rootDb, o.options.statementTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("openConnectionWithDefaults: %w", err)
 	}
@@ -214,7 +231,7 @@ func (o *onInstanceFactory) Create(ctx context.Context) (_ *Database, _retErr er
 		// We should close the connection pool on the off-chance that the drop database fails
 		_ = tempDbConnPool.Close()
 	})
-	if err := assertConnPoolIsOnExpectedDatabase(ctx, tempDbConnPool, tempDbName); err != nil {
+	if err := assertConnPoolIsOnExpectedDatabase(ctx, tempDbConnPool, tempDbName, o.options.statementTimeout); err != nil {
 		return nil, fmt.Errorf("assertConnPoolIsOnExpectedDatabase: %w", err)
 	}
 
@@ -249,8 +266,8 @@ func (o *onInstanceFactory) Create(ctx context.Context) (_ *Database, _retErr er
 }
 
 // assertConnPoolIsOnExpectedDatabase provides validation that a user properly passed in a proper CreateConnPoolForDbFn
-func assertConnPoolIsOnExpectedDatabase(ctx context.Context, connPool *sql.DB, expectedDatabase string) (retErr error) {
-	conn, err := openConnectionWithDefaults(ctx, connPool)
+func assertConnPoolIsOnExpectedDatabase(ctx context.Context, connPool *sql.DB, expectedDatabase string, statementTimeout time.Duration) (retErr error) {
+	conn, err := openConnectionWithDefaults(ctx, connPool, statementTimeout)
 	if err != nil {
 		return fmt.Errorf("openConnectionWithDefaults: %w", err)
 	}
@@ -272,7 +289,7 @@ func (o *onInstanceFactory) dropTempDatabase(ctx context.Context, dbName string)
 		return fmt.Errorf("drop non-temporary database: %s", dbName)
 	}
 
-	rootConn, err := openConnectionWithDefaults(ctx, o.rootDb)
+	rootConn, err := openConnectionWithDefaults(ctx, o.rootDb, o.options.statementTimeout)
 	if err != nil {
 		return fmt.Errorf("openConnectionWithDefaults: %w", err)
 	}
@@ -291,8 +308,8 @@ func (o *onInstanceFactory) dropTempDatabase(ctx context.Context, dbName string)
 }
 
 // openConnectionWithDefaults uses the provided connection pool to open a connection to the database and sets safe
-// defaults, such as statement_timeout
-func openConnectionWithDefaults(ctx context.Context, connPool *sql.DB) (_ *sql.Conn, retErr error) {
+// defaults, such as statement_timeout. statementTimeout=0 means no override (Postgres default applies).
+func openConnectionWithDefaults(ctx context.Context, connPool *sql.DB, statementTimeout time.Duration) (_ *sql.Conn, retErr error) {
 	conn, err := connPool.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting connection: %w", err)
@@ -301,8 +318,10 @@ func openConnectionWithDefaults(ctx context.Context, connPool *sql.DB) (_ *sql.C
 		_ = conn.Close()
 	})
 
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION statement_timeout = %d;", DefaultStatementTimeout.Milliseconds())); err != nil {
-		return nil, fmt.Errorf("setting statement timeout: %w", err)
+	if statementTimeout > 0 {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION statement_timeout = %d;", statementTimeout.Milliseconds())); err != nil {
+			return nil, fmt.Errorf("setting statement timeout: %w", err)
+		}
 	}
 	return conn, nil
 }
