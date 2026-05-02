@@ -122,6 +122,8 @@ type (
 		statementTimeoutModifiers []string
 		lockTimeoutModifiers      []string
 		insertStatements          []string
+
+		tempDbStatementTimeout time.Duration
 	}
 
 	outputFormat struct {
@@ -147,6 +149,8 @@ type (
 		statementTimeoutModifiers []timeoutModifier
 		lockTimeoutModifiers      []timeoutModifier
 		insertStatements          []insertStatement
+
+		tempDbStatementTimeout time.Duration
 	}
 
 	// schemaSourceFactoryFlags stores the flags that are parsed into a schemaSourceFactory.
@@ -244,6 +248,17 @@ func createPlanOptionsFlags(cmd *cobra.Command) *planOptionsFlags {
 			indexInsertStatementKey, statementInsertStatementKey, statementTimeoutInsertStatementKey, lockTimeoutInsertStatementKey,
 			indexInsertStatementKey, statementInsertStatementKey, statementTimeoutInsertStatementKey, lockTimeoutInsertStatementKey,
 		),
+	)
+
+	cmd.Flags().DurationVar(
+		&flags.tempDbStatementTimeout,
+		"temp-db-statement-timeout", 0,
+		"statement_timeout applied to the connections that create + drop pg-schema-diff's "+
+			"internal temporary database. 0 (default) preserves the library default of 3s. "+
+			"Bump this when running multiple pg-schema-diff invocations concurrently against "+
+			"the same cluster: Postgres serializes CREATE DATABASE, and the wait can exceed "+
+			"the 3s default under load (e.g., parallel CI matrices), surfacing as "+
+			"\"canceling statement due to statement timeout\".",
 	)
 
 	return &flags
@@ -373,6 +388,7 @@ func parsePlanOptions(p planOptionsFlags) (planOptions, error) {
 		statementTimeoutModifiers: statementTimeoutModifiers,
 		lockTimeoutModifiers:      lockTimeoutModifiers,
 		insertStatements:          insertStatements,
+		tempDbStatementTimeout:    p.tempDbStatementTimeout,
 	}, nil
 }
 
@@ -479,11 +495,20 @@ func generatePlan(
 	ctx context.Context,
 	params generatePlanParameters,
 ) (diff.Plan, error) {
+	tempDbFactoryOpts := []tempdb.OnInstanceFactoryOpt{
+		tempdb.WithRootDatabase(params.tempDbConnConfig.Database),
+	}
+	if params.planOptions.tempDbStatementTimeout > 0 {
+		tempDbFactoryOpts = append(tempDbFactoryOpts,
+			tempdb.WithStatementTimeout(params.planOptions.tempDbStatementTimeout),
+			tempdb.WithDropTimeout(params.planOptions.tempDbStatementTimeout),
+		)
+	}
 	tempDbFactory, err := tempdb.NewOnInstanceFactory(ctx, func(ctx context.Context, dbName string) (*sql.DB, error) {
 		cfg := params.tempDbConnConfig.Copy()
 		cfg.Database = dbName
 		return openDbWithPgxConfig(cfg)
-	}, tempdb.WithRootDatabase(params.tempDbConnConfig.Database))
+	}, tempDbFactoryOpts...)
 	if err != nil {
 		return diff.Plan{}, fmt.Errorf("creating temp db factory: %w", err)
 	}
