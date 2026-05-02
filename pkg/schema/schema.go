@@ -11,8 +11,9 @@ import (
 type GetSchemaOpt = internalschema.GetSchemaOpt
 
 var (
-	WithIncludeSchemas = internalschema.WithIncludeSchemas
-	WithExcludeSchemas = internalschema.WithExcludeSchemas
+	WithIncludeSchemas     = internalschema.WithIncludeSchemas
+	WithExcludeSchemas     = internalschema.WithExcludeSchemas
+	WithExcludeNameRegexes = internalschema.WithExcludeNameRegexes
 )
 
 // GetSchemaHash hash gets the hash of the target schema. It can be used to compare against the hash in the migration

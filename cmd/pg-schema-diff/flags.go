@@ -2,12 +2,29 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/go-logfmt/logfmt"
 	"github.com/jackc/pgx/v4"
 	"github.com/spf13/cobra"
 )
+
+// compileExcludeNameRegexes compiles the raw `--exclude-name-regex` strings
+// into regexp.Regexp values. Used by both `plan` and `dump` commands so the
+// failure mode (invalid regex) is reported with the same wording from either
+// path.
+func compileExcludeNameRegexes(raw []string) ([]*regexp.Regexp, error) {
+	out := make([]*regexp.Regexp, 0, len(raw))
+	for _, r := range raw {
+		re, err := regexp.Compile(r)
+		if err != nil {
+			return nil, fmt.Errorf("compiling --exclude-name-regex %q: %w", r, err)
+		}
+		out = append(out, re)
+	}
+	return out, nil
+}
 
 type connectionFlags struct {
 	// dsn is the connection string for the database.
