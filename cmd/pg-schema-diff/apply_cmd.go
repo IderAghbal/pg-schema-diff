@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -12,6 +15,23 @@ import (
 	"github.com/stripe/pg-schema-diff/pkg/diff"
 	"github.com/stripe/pg-schema-diff/pkg/log"
 )
+
+const (
+	patternAllowHazardOnKey = "pattern"
+	hazardAllowHazardOnKey  = "hazard"
+)
+
+// scopedHazardAllowance is one parsed --allow-hazard-on entry: a hazard type that is allowed only on
+// statements whose DDL matches the regex.
+//
+// The pattern is matched against the full DDL string. Multi-line DDL (e.g., CREATE FUNCTION bodies)
+// is treated as a single haystack — `^` and `$` anchor the entire DDL by default, not individual
+// lines. Authors who need line-level anchors should prefix the pattern with `(?m)` to enable
+// multi-line mode (Go RE2 flag).
+type scopedHazardAllowance struct {
+	pattern *regexp.Regexp
+	hazard  diff.MigrationHazardType
+}
 
 func buildApplyCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -26,6 +46,18 @@ func buildApplyCmd() *cobra.Command {
 		"Specify the hazards that are allowed. Order does not matter, and duplicates are ignored. If the"+
 			" migration plan contains unwanted hazards (hazards not in this list), then the migration will fail to run"+
 			" (example: --allow-hazards DELETES_DATA,INDEX_BUILD)")
+	scopedHazardStrs := cmd.Flags().StringArray("allow-hazard-on", nil,
+		fmt.Sprintf(
+			"Allow a specific hazard only on statements whose DDL matches a regex. Repeatable. Format: "+
+				"'%s=\"<regex>\" %s=<HAZARD_TYPE>'. Example: -allow-hazard-on '%s=\"CREATE OR REPLACE FUNCTION public.compute_slug_full_path\" %s=HAS_UNTRACKABLE_DEPENDENCIES'. "+
+				"Use this when --allow-hazards would be too broad — a project-wide HAS_UNTRACKABLE_DEPENDENCIES waiver "+
+				"silences every plpgsql function, while a per-pattern waiver scopes the allowance to one DDL. "+
+				"The regex is matched against the full DDL string (which may span multiple lines): "+
+				"'^' and '$' anchor the entire DDL by default; prefix with '(?m)' if you need line-level anchors "+
+				"(e.g., '(?m)^CREATE TABLE'). Go RE2 syntax.",
+			patternAllowHazardOnKey, hazardAllowHazardOnKey,
+			patternAllowHazardOnKey, hazardAllowHazardOnKey,
+		))
 	skipConfirmPrompt := cmd.Flags().Bool("skip-confirm-prompt", false, "Skips prompt asking for user to confirm before applying")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		logger := log.SimpleLogger()
@@ -65,7 +97,12 @@ func buildApplyCmd() *cobra.Command {
 		cmdPrintln(cmd, header("Review plan"))
 		cmdPrint(cmd, planToPrettyS(plan), "\n\n")
 
-		if err := failIfHazardsNotAllowed(plan, *allowedHazardsTypesStrs); err != nil {
+		scopedAllowances, err := parseScopedHazardAllowances(*scopedHazardStrs)
+		if err != nil {
+			return err
+		}
+
+		if err := failIfHazardsNotAllowed(plan, *allowedHazardsTypesStrs, scopedAllowances); err != nil {
 			return err
 		}
 
@@ -90,7 +127,7 @@ func buildApplyCmd() *cobra.Command {
 	return cmd
 }
 
-func failIfHazardsNotAllowed(plan diff.Plan, allowedHazardsTypesStrs []string) error {
+func failIfHazardsNotAllowed(plan diff.Plan, allowedHazardsTypesStrs []string, scopedAllowances []scopedHazardAllowance) error {
 	isAllowedByHazardType := make(map[diff.MigrationHazardType]bool)
 	for _, val := range allowedHazardsTypesStrs {
 		isAllowedByHazardType[strings.ToUpper(val)] = true
@@ -99,9 +136,13 @@ func failIfHazardsNotAllowed(plan diff.Plan, allowedHazardsTypesStrs []string) e
 	for i, stmt := range plan.Statements {
 		var disallowedTypes []diff.MigrationHazardType
 		for _, hzd := range stmt.Hazards {
-			if !isAllowedByHazardType[hzd.Type] {
-				disallowedTypes = append(disallowedTypes, hzd.Type)
+			if isAllowedByHazardType[hzd.Type] {
+				continue
 			}
+			if isScopedAllowance(stmt, hzd.Type, scopedAllowances) {
+				continue
+			}
+			disallowedTypes = append(disallowedTypes, hzd.Type)
 		}
 		if len(disallowedTypes) > 0 {
 			disallowedHazardMsgs = append(disallowedHazardMsgs,
@@ -112,12 +153,61 @@ func failIfHazardsNotAllowed(plan diff.Plan, allowedHazardsTypesStrs []string) e
 	}
 	if len(disallowedHazardMsgs) > 0 {
 		return fmt.Errorf("prohited hazards found\n"+
-			"These hazards must be allowed via the allow-hazards flag, e.g., --allow-hazards %s\n"+
+			"These hazards must be allowed via the allow-hazards or allow-hazard-on flag, e.g., --allow-hazards %s\n"+
 			"Prohibited hazards in the following statements:\n%s",
 			strings.Join(getHazardTypes(plan), ","),
 			strings.Join(disallowedHazardMsgs, "\n"))
 	}
 	return nil
+}
+
+// isScopedAllowance reports whether the (statement, hazard) pair is covered by any --allow-hazard-on entry.
+// A scoped allowance applies when its hazard type matches and its regex matches the statement DDL.
+func isScopedAllowance(stmt diff.Statement, hazardType diff.MigrationHazardType, allowances []scopedHazardAllowance) bool {
+	for _, a := range allowances {
+		if a.hazard != hazardType {
+			continue
+		}
+		if a.pattern.MatchString(stmt.DDL) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseScopedHazardAllowances parses each --allow-hazard-on entry (logfmt: 'pattern="<regex>" hazard=<TYPE>').
+// Hazard names are normalized to upper-case to match diff.MigrationHazardType.
+func parseScopedHazardAllowances(raw []string) ([]scopedHazardAllowance, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]scopedHazardAllowance, 0, len(raw))
+	for _, val := range raw {
+		fm, err := logFmtToMap(val)
+		if err != nil {
+			return nil, fmt.Errorf("parsing --allow-hazard-on %q: %w", val, err)
+		}
+		patternStr, err := mustGetAndDeleteKey(fm, patternAllowHazardOnKey)
+		if err != nil {
+			return nil, fmt.Errorf("parsing --allow-hazard-on %q: %w", val, err)
+		}
+		hazardStr, err := mustGetAndDeleteKey(fm, hazardAllowHazardOnKey)
+		if err != nil {
+			return nil, fmt.Errorf("parsing --allow-hazard-on %q: %w", val, err)
+		}
+		if len(fm) > 0 {
+			return nil, fmt.Errorf("parsing --allow-hazard-on %q: unknown keys %s", val, slices.Sorted(maps.Keys(fm)))
+		}
+		re, err := regexp.Compile(patternStr)
+		if err != nil {
+			return nil, fmt.Errorf("parsing --allow-hazard-on %q: pattern %q: %w", val, patternStr, err)
+		}
+		out = append(out, scopedHazardAllowance{
+			pattern: re,
+			hazard:  diff.MigrationHazardType(strings.ToUpper(hazardStr)),
+		})
+	}
+	return out, nil
 }
 
 func runPlan(ctx context.Context, cmd *cobra.Command, connConfig *pgx.ConnConfig, plan diff.Plan) error {
