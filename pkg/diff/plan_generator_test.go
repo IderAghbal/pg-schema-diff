@@ -33,6 +33,21 @@ func (f fakeSchemaSource) GetSchema(_ context.Context, deps schemaSourcePlanDeps
 	return f.schema, f.err
 }
 
+type poolRecordingFactory struct {
+	tempdb.Factory
+
+	pools []*sql.DB
+}
+
+func (f *poolRecordingFactory) Create(ctx context.Context) (*tempdb.Database, error) {
+	db, err := f.Factory.Create(ctx)
+	if err != nil {
+		return nil, err
+	}
+	f.pools = append(f.pools, db.ConnPool)
+	return db, nil
+}
+
 type planGeneratorTestSuite struct {
 	suite.Suite
 
@@ -189,6 +204,20 @@ func (suite *planGeneratorTestSuite) TestGenerate_CannotValidateWithoutTempDbFac
 		WithDoNotValidatePlan(),
 	)
 	suite.ErrorContains(err, "tempDbFactory is required")
+}
+
+func (suite *planGeneratorTestSuite) TestDDLSchemaSource_LimitsTempDbConnections() {
+	tempDbFactory := suite.mustBuildTempDbFactory(context.Background())
+	defer tempDbFactory.Close()
+	factory := &poolRecordingFactory{Factory: tempDbFactory}
+
+	_, err := DDLSchemaSource([]string{`CREATE TABLE foobar(id INT PRIMARY KEY);`}).GetSchema(context.Background(), schemaSourcePlanDeps{
+		tempDBFactory: factory,
+		logger:        log.SimpleLogger(),
+	})
+	suite.Require().NoError(err)
+	suite.Require().Len(factory.pools, 1)
+	suite.Equal(tempDbMaxConnections, factory.pools[0].Stats().MaxOpenConnections)
 }
 
 func TestSimpleMigratorTestSuite(t *testing.T) {

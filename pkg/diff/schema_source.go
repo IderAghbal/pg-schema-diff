@@ -113,6 +113,7 @@ func (s *ddlSchemaSource) GetSchema(ctx context.Context, deps schemaSourcePlanDe
 			deps.logger.Errorf("an error occurred while dropping the temp database: %s", err)
 		}
 	}(tempDb.ContextualCloser)
+	setMaxConnectionsIfNotSet(tempDb.ConnPool, tempDbMaxConnections)
 
 	for _, ddlStmt := range s.ddl {
 		if _, err := tempDb.ConnPool.ExecContext(ctx, ddlStmt.stmt); err != nil {
