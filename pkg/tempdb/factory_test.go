@@ -190,6 +190,124 @@ func (suite *onInstanceTempDbFactorySuite) TestCreate_CreateAndDropFlow() {
 	suite.True(createdAt.Before(afterTimeOfCreation))
 }
 
+// A session left on the temporary database made DROP DATABASE wait for it and fail, which a drop under a statement
+// timeout shorter than that wait reported as "canceling statement due to statement timeout" and left the database
+// behind.
+func (suite *onInstanceTempDbFactorySuite) TestClose_DropsADatabaseASessionIsStillOn() {
+	ctx := context.Background()
+	factory := suite.mustBuildFactory(WithDropTimeout(DefaultStatementTimeout))
+	defer func(factory Factory) {
+		suite.Require().NoError(factory.Close())
+	}(factory)
+
+	tempDb, err := factory.Create(ctx)
+	suite.Require().NoError(err)
+	var dbName string
+	suite.Require().NoError(tempDb.ConnPool.QueryRowContext(ctx, "SELECT current_database()").Scan(&dbName))
+
+	holderPool, err := suite.getConnPoolForDb(dbName)
+	suite.Require().NoError(err)
+	defer holderPool.Close()
+	holder, err := holderPool.Conn(ctx)
+	suite.Require().NoError(err)
+	defer holder.Close()
+	_, err = holder.ExecContext(ctx, "SET SESSION statement_timeout = 100")
+	suite.Require().NoError(err)
+	_, err = holder.ExecContext(ctx, "BEGIN")
+	suite.Require().NoError(err)
+	_, err = holder.ExecContext(ctx, "SELECT 1")
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(tempDb.Close(ctx))
+
+	suite.Equal(0, suite.countDatabasesNamed(dbName))
+	_, err = holder.ExecContext(ctx, "SELECT 1")
+	suite.Error(err, "the session left on the dropped database should have been terminated")
+}
+
+// A database already gone counts as dropped, so a retry after an attempt whose drop committed does not fail.
+func (suite *onInstanceTempDbFactorySuite) TestClose_ADatabaseAlreadyGoneCountsAsDropped() {
+	ctx := context.Background()
+	factory := suite.mustBuildFactory()
+	defer func(factory Factory) {
+		suite.Require().NoError(factory.Close())
+	}(factory)
+
+	tempDb, err := factory.Create(ctx)
+	suite.Require().NoError(err)
+	var dbName string
+	suite.Require().NoError(tempDb.ConnPool.QueryRowContext(ctx, "SELECT current_database()").Scan(&dbName))
+	suite.Require().NoError(tempDb.ConnPool.Close())
+
+	rootPool, err := suite.getConnPoolForDb("postgres")
+	suite.Require().NoError(err)
+	defer rootPool.Close()
+	_, err = rootPool.ExecContext(ctx, fmt.Sprintf("DROP DATABASE %s WITH (FORCE)", dbName))
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(tempDb.Close(ctx))
+	suite.Equal(0, suite.countDatabasesNamed(dbName))
+}
+
+// An attempt that runs out of time is retried rather than leaving the database behind. A transaction on another
+// database holds a lock on the temporary one, which no session on it would release, until the first attempt has
+// failed.
+func (suite *onInstanceTempDbFactorySuite) TestClose_RetriesADropThatRanOutOfTime() {
+	ctx := context.Background()
+	retried := &retryLogger{retries: make(chan string, 8)}
+	factory := suite.mustBuildFactory(WithDropTimeout(500*time.Millisecond), WithLogger(retried))
+	defer func(factory Factory) {
+		suite.Require().NoError(factory.Close())
+	}(factory)
+
+	tempDb, err := factory.Create(ctx)
+	suite.Require().NoError(err)
+	var dbName string
+	suite.Require().NoError(tempDb.ConnPool.QueryRowContext(ctx, "SELECT current_database()").Scan(&dbName))
+
+	rootPool, err := suite.getConnPoolForDb("postgres")
+	suite.Require().NoError(err)
+	defer rootPool.Close()
+	blocker, err := rootPool.BeginTx(ctx, nil)
+	suite.Require().NoError(err)
+	_, err = blocker.ExecContext(ctx, fmt.Sprintf("COMMENT ON DATABASE %s IS 'held'", dbName))
+	suite.Require().NoError(err)
+	released := make(chan error, 1)
+	go func() {
+		select {
+		case <-retried.retries:
+		case <-time.After(30 * time.Second):
+		}
+		released <- blocker.Commit()
+	}()
+
+	suite.Require().NoError(tempDb.Close(ctx))
+	suite.Require().NoError(<-released)
+	suite.Equal(0, suite.countDatabasesNamed(dbName))
+}
+
+type retryLogger struct {
+	retries chan string
+}
+
+func (l *retryLogger) Errorf(msg string, args ...any) {}
+
+func (l *retryLogger) Warnf(msg string, args ...any) {
+	select {
+	case l.retries <- fmt.Sprintf(msg, args...):
+	default:
+	}
+}
+
+func (suite *onInstanceTempDbFactorySuite) countDatabasesNamed(dbName string) int {
+	rootPool, err := suite.getConnPoolForDb("postgres")
+	suite.Require().NoError(err)
+	defer rootPool.Close()
+	var count int
+	suite.Require().NoError(rootPool.QueryRowContext(context.Background(), "SELECT count(*) FROM pg_database WHERE datname = $1", dbName).Scan(&count))
+	return count
+}
+
 func (suite *onInstanceTempDbFactorySuite) TestCreate_ConnectsToWrongDatabase() {
 	factory, err := NewOnInstanceFactory(context.Background(), func(ctx context.Context, dbName string) (*sql.DB, error) {
 		return suite.getConnPoolForDb("postgres")

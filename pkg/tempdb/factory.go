@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -24,6 +25,13 @@ const (
 	DefaultOnInstanceMetadataTable  = "metadata"
 
 	DefaultStatementTimeout = 3 * time.Second
+	// DefaultDropTimeout bounds each attempt to drop a temporary database. DROP DATABASE waits on an immediate
+	// checkpoint, which a busy instance can take well past DefaultStatementTimeout to finish.
+	DefaultDropTimeout = time.Minute
+
+	// dropAttempts bounds how many times a temporary database's drop is tried before it is left behind for a cleanup
+	// by prefix and metadata, as NewOnInstanceFactory describes.
+	dropAttempts = 3
 )
 
 type ContextualCloser interface {
@@ -106,7 +114,7 @@ func WithRootDatabase(db string) OnInstanceFactoryOpt {
 	}
 }
 
-// WithDropTimeout sets the timeout used when dropping database
+// WithDropTimeout sets the statement timeout of each attempt to drop a temporary database
 func WithDropTimeout(d time.Duration) OnInstanceFactoryOpt {
 	return func(opts *onInstanceFactoryOptions) {
 		opts.dropTimeout = d
@@ -162,7 +170,7 @@ func NewOnInstanceFactory(ctx context.Context, createConnPoolForDb CreateConnPoo
 		dbPrefix:         DefaultOnInstanceDbPrefix,
 		metadataSchema:   DefaultOnInstanceMetadataSchema,
 		metadataTable:    DefaultOnInstanceMetadataTable,
-		dropTimeout:      DefaultStatementTimeout,
+		dropTimeout:      DefaultDropTimeout,
 		statementTimeout: DefaultStatementTimeout,
 		rootDatabase:     "postgres",
 		logger:           log.SimpleLogger(),
@@ -284,11 +292,37 @@ func assertConnPoolIsOnExpectedDatabase(ctx context.Context, connPool *sql.DB, e
 	return nil
 }
 
-func (o *onInstanceFactory) dropTempDatabase(ctx context.Context, dbName string) (retErr error) {
+// dropTempDatabase drops the temporary database, trying up to dropAttempts times, so one attempt that runs out of time
+// does not leave the database behind. A database already gone counts as dropped, which keeps a retry of an attempt
+// whose drop committed but whose reply was lost from failing.
+func (o *onInstanceFactory) dropTempDatabase(ctx context.Context, dbName string) error {
 	if !strings.HasPrefix(dbName, o.options.dbPrefix) {
 		return fmt.Errorf("drop non-temporary database: %s", dbName)
 	}
 
+	var err error
+	for attempt := 1; attempt <= dropAttempts; attempt++ {
+		if err = o.dropTempDatabaseOnce(ctx, dbName); err == nil {
+			return nil
+		}
+		if attempt == dropAttempts {
+			break
+		}
+		o.options.logger.Warnf("Dropping temporary database %s failed on attempt %d of %d, retrying: %q", dbName, attempt, dropAttempts, err.Error())
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("dropping temporary database: %w", errors.Join(err, ctx.Err()))
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+	return fmt.Errorf("dropping temporary database after %d attempts: %w", dropAttempts, err)
+}
+
+// dropTempDatabaseOnce drops the temporary database on a connection of its own, under the drop's own statement timeout
+// rather than the factory's. A session still on the database, such as a pool connection whose close the server has not
+// yet seen, would make DROP DATABASE wait for it and then fail, so the drop terminates them: WITH (FORCE) from Postgres
+// 13, and pg_terminate_backend before it.
+func (o *onInstanceFactory) dropTempDatabaseOnce(ctx context.Context, dbName string) error {
 	rootConn, err := openConnectionWithDefaults(ctx, o.rootDb, o.options.statementTimeout)
 	if err != nil {
 		return fmt.Errorf("openConnectionWithDefaults: %w", err)
@@ -299,8 +333,18 @@ func (o *onInstanceFactory) dropTempDatabase(ctx context.Context, dbName string)
 		return fmt.Errorf("setting statement timeout: %w", err)
 	}
 
-	_, err = rootConn.ExecContext(ctx, fmt.Sprintf("DROP DATABASE %s;", dbName))
-	if err != nil {
+	var serverVersionNum int
+	if err := rootConn.QueryRowContext(ctx, "SELECT current_setting('server_version_num')::int").Scan(&serverVersionNum); err != nil {
+		return fmt.Errorf("reading server version: %w", err)
+	}
+	drop := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE);", dbName)
+	if serverVersionNum < 130000 {
+		if _, err := rootConn.ExecContext(ctx, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid();", dbName); err != nil {
+			return fmt.Errorf("terminating sessions on temporary database: %w", err)
+		}
+		drop = fmt.Sprintf("DROP DATABASE IF EXISTS %s;", dbName)
+	}
+	if _, err := rootConn.ExecContext(ctx, drop); err != nil {
 		return fmt.Errorf("dropping temporary database: %w", err)
 	}
 
