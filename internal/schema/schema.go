@@ -221,6 +221,9 @@ type Table struct {
 	ReplicaIdentity  ReplicaIdentity
 	RLSEnabled       bool
 	RLSForced        bool
+	// Options are the table's storage parameters, i.e., pg_class.reloptions, keyed as WITH and SET name them:
+	// the table's own under their names, and its TOAST table's under "toast.". Nil when it has none.
+	Options map[string]string
 
 	// PartitionKeyDef is the output of Pg function pg_get_partkeydef:
 	// PARTITION BY $PartitionKeyDef
@@ -1092,6 +1095,10 @@ func (s *schemaFetcher) buildTable(
 		SchemaName:  table.TableSchemaName,
 		EscapedName: EscapeIdentifier(table.TableName),
 	}
+	options, err := tableOptions(table.RelOptions, table.ToastRelOptions)
+	if err != nil {
+		return Table{}, fmt.Errorf("storage parameters of %s: %w", schemaQualifiedName.GetFQEscapedName(), err)
+	}
 	return Table{
 		SchemaQualifiedName: schemaQualifiedName,
 		Columns:             columns,
@@ -1101,6 +1108,7 @@ func (s *schemaFetcher) buildTable(
 		ReplicaIdentity:     ReplicaIdentity(table.ReplicaIdentity),
 		RLSEnabled:          table.RlsEnabled,
 		RLSForced:           table.RlsForced,
+		Options:             options,
 
 		PartitionKeyDef: table.PartitionKeyDef,
 
@@ -1689,6 +1697,26 @@ func EscapeIdentifier(name string) string {
 func EscapeLiteral(val string) string {
 	val = strings.ReplaceAll(val, string([]byte{0}), "")
 	return "'" + strings.ReplaceAll(val, "'", "''") + "'"
+}
+
+// tableOptions merges a table's reloptions and its TOAST table's into one map, the TOAST table's keyed under
+// "toast.", which is how CREATE TABLE ... WITH and ALTER TABLE ... SET name them. Nil when there are none.
+func tableOptions(rel, toastRel []string) (map[string]string, error) {
+	if len(rel) == 0 && len(toastRel) == 0 {
+		return nil, nil
+	}
+	out, err := relOptionsToMap(rel)
+	if err != nil {
+		return nil, err
+	}
+	toast, err := relOptionsToMap(toastRel)
+	if err != nil {
+		return nil, fmt.Errorf("toast: %w", err)
+	}
+	for k, v := range toast {
+		out["toast."+k] = v
+	}
+	return out, nil
 }
 
 // relOptionsToMap converts pg_catalog.pg_class.reloptions to a map.

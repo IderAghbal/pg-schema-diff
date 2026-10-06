@@ -1102,11 +1102,16 @@ SELECT
     (CASE
         WHEN c.relispartition THEN pg_catalog.pg_get_expr(c.relpartbound, c.oid)
         ELSE ''
-    END)::TEXT AS partition_for_values
+    END)::TEXT AS partition_for_values,
+    c.reloptions::TEXT [] AS rel_options,
+    toast_c.reloptions::TEXT [] AS toast_rel_options
 FROM pg_catalog.pg_class AS c
 INNER JOIN
     pg_catalog.pg_namespace AS table_namespace
     ON c.relnamespace = table_namespace.oid
+LEFT JOIN
+    pg_catalog.pg_class AS toast_c
+    ON c.reltoastrelid = toast_c.oid
 LEFT JOIN
     pg_catalog.pg_inherits AS table_inherits
     ON c.oid = table_inherits.inhrelid
@@ -1143,6 +1148,8 @@ type GetTablesRow struct {
 	ParentTableSchemaName string
 	PartitionKeyDef       string
 	PartitionForValues    string
+	RelOptions            []string
+	ToastRelOptions       []string
 }
 
 func (q *Queries) GetTables(ctx context.Context) ([]GetTablesRow, error) {
@@ -1165,6 +1172,8 @@ func (q *Queries) GetTables(ctx context.Context) ([]GetTablesRow, error) {
 			&i.ParentTableSchemaName,
 			&i.PartitionKeyDef,
 			&i.PartitionForValues,
+			pq.Array(&i.RelOptions),
+			pq.Array(&i.ToastRelOptions),
 		); err != nil {
 			return nil, err
 		}
