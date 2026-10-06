@@ -835,6 +835,9 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 	if table.IsPartitioned() {
 		createTableSb.WriteString(fmt.Sprintf(" PARTITION BY %s", table.PartitionKeyDef))
 	}
+	if len(table.Options) > 0 {
+		createTableSb.WriteString(fmt.Sprintf(" WITH (%s)", strings.Join(storageParameterAssignments(table.Options, keysOf(table.Options)), ", ")))
+	}
 	stmts = append(stmts, Statement{
 		DDL:         createTableSb.String(),
 		Timeout:     statementTimeoutDefault,
@@ -961,6 +964,8 @@ func (t *tableSQLVertexGenerator) Alter(diff tableDiff) ([]Statement, error) {
 		}
 		stmts = append(stmts, alterReplicaIdentityStmt)
 	}
+
+	stmts = append(stmts, alterStorageParametersStatements(diff.old, diff.new)...)
 
 	// We want to enable RLS after we do any other operations on the table, i.e., create policies, to avoid creating an
 	// outtage while RLS is being enabled
@@ -1124,6 +1129,75 @@ func (t *tableSQLVertexGenerator) alterPartition(diff tableDiff) ([]Statement, e
 	}
 
 	return stmts, nil
+}
+
+// alterStorageParametersStatements sets the storage parameters the new table declares that the old one lacks or holds
+// at another value, and resets those only the old one holds. A partition's are its own: it inherits none from its
+// parent, so a partition is altered like any table.
+func alterStorageParametersStatements(old, new schema.Table) []Statement {
+	var set, reset []string
+	for k, v := range new.Options {
+		if oldV, ok := old.Options[k]; !ok || oldV != v {
+			set = append(set, k)
+		}
+	}
+	for k := range old.Options {
+		if _, ok := new.Options[k]; !ok {
+			reset = append(reset, k)
+		}
+	}
+	sort.Strings(set)
+	sort.Strings(reset)
+
+	var stmts []Statement
+	if len(set) > 0 {
+		stmts = append(stmts, storageParametersStatement(new.SchemaQualifiedName,
+			fmt.Sprintf("SET (%s)", strings.Join(storageParameterAssignments(new.Options, set), ", ")), set))
+	}
+	if len(reset) > 0 {
+		stmts = append(stmts, storageParametersStatement(new.SchemaQualifiedName,
+			fmt.Sprintf("RESET (%s)", strings.Join(reset, ", ")), reset))
+	}
+	return stmts
+}
+
+// storageParametersStatement alters storage parameters, which takes a SHARE UPDATE EXCLUSIVE lock for every
+// parameter but user_catalog_table, which takes an ACCESS EXCLUSIVE one.
+func storageParametersStatement(table schema.SchemaQualifiedName, action string, keys []string) Statement {
+	stmt := Statement{
+		DDL:         fmt.Sprintf("%s %s", alterTablePrefix(table), action),
+		Timeout:     statementTimeoutDefault,
+		LockTimeout: lockTimeoutDefault,
+	}
+	for _, k := range keys {
+		if k == "user_catalog_table" {
+			stmt.Hazards = append(stmt.Hazards, MigrationHazard{
+				Type:    MigrationHazardTypeAcquiresAccessExclusiveLock,
+				Message: "Changing user_catalog_table locks the table against reads and writes",
+			})
+			break
+		}
+	}
+	return stmt
+}
+
+// storageParameterAssignments renders keys as name = 'value' in the order given, quoting every value as a literal,
+// which is how pg_dump writes them and what every storage parameter accepts.
+func storageParameterAssignments(options map[string]string, keys []string) []string {
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, fmt.Sprintf("%s = %s", k, schema.EscapeLiteral(options[k])))
+	}
+	return out
+}
+
+func keysOf(options map[string]string) []string {
+	keys := make([]string, 0, len(options))
+	for k := range options {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func alterReplicaIdentityStatement(table schema.SchemaQualifiedName, identity schema.ReplicaIdentity) (Statement, error) {
