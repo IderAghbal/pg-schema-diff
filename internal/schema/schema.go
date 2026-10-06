@@ -1365,20 +1365,7 @@ var pgSchemaDiffDirectiveRegex = regexp.MustCompile(`(?im)^\s*--\s*pg-schema-dif
 // authored against newer directives don't break; the trackability flag is still flipped so the
 // directive intent is honored at the level the older tool understands.
 func hasFunctionTrackabilityDirective(funcDef string) bool {
-	matches := pgSchemaDiffDirectiveRegex.FindAllStringSubmatch(funcDef, -1)
-	for _, m := range matches {
-		// Lower-case the body so the comparison below is case-insensitive in the same way
-		// the regex itself is. The regex's (?i) handles the prefix; this handles the body.
-		body := strings.ToLower(strings.TrimSpace(m[1]))
-		if body == "no-untrackable-deps" {
-			return true
-		}
-		// Unknown directive — recognized as a directive (so trackability is asserted) but
-		// otherwise ignored. Future versions can add new directive forms without churning
-		// schemas authored against this version.
-		return true
-	}
-	return false
+	return pgSchemaDiffDirectiveRegex.MatchString(funcDef)
 }
 
 func (s *schemaFetcher) fetchDependsOnFunctions(ctx context.Context, systemCatalog string, oid any) ([]SchemaQualifiedName, error) {

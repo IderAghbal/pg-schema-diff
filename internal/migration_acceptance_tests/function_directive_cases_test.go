@@ -70,7 +70,7 @@ var functionDirectiveAcceptanceTestCases = []acceptanceTestCase{
 		expectedHazardTypes: nil,
 	},
 	{
-		name: "sql-language function unaffected — was always trackable",
+		name:         "sql-language function unaffected — was always trackable",
 		oldSchemaDDL: nil,
 		newSchemaDDL: []string{`
             CREATE FUNCTION public.add(a integer, b integer) RETURNS integer
