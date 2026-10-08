@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -27,6 +30,9 @@ func buildApplyCmd() *cobra.Command {
 			" migration plan contains unwanted hazards (hazards not in this list), then the migration will fail to run"+
 			" (example: --allow-hazards DELETES_DATA,INDEX_BUILD)")
 	skipConfirmPrompt := cmd.Flags().Bool("skip-confirm-prompt", false, "Skips prompt asking for user to confirm before applying")
+	statementHookFile := cmd.Flags().String("statement-hook-file", "",
+		"SQL file to run after every statement of the plan: in the statement's own transaction, or straight after it"+
+			" for a statement that cannot run in a transaction block (CREATE or DROP INDEX CONCURRENTLY)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		logger := log.SimpleLogger()
 
@@ -44,6 +50,15 @@ func buildApplyCmd() *cobra.Command {
 		planOptions, err := parsePlanOptions(*planOptsFlags)
 		if err != nil {
 			return err
+		}
+
+		var statementHook string
+		if *statementHookFile != "" {
+			hook, err := os.ReadFile(*statementHookFile)
+			if err != nil {
+				return fmt.Errorf("reading statement hook file: %w", err)
+			}
+			statementHook = string(hook)
 		}
 
 		cmd.SilenceUsage = true
@@ -80,7 +95,7 @@ func buildApplyCmd() *cobra.Command {
 			}
 		}
 
-		if err := runPlan(cmd.Context(), cmd, connConfig, plan); err != nil {
+		if err := runPlan(cmd.Context(), cmd, connConfig, plan, statementHook); err != nil {
 			return err
 		}
 		cmdPrintln(cmd, "Schema applied successfully")
@@ -120,7 +135,10 @@ func failIfHazardsNotAllowed(plan diff.Plan, allowedHazardsTypesStrs []string) e
 	return nil
 }
 
-func runPlan(ctx context.Context, cmd *cobra.Command, connConfig *pgx.ConnConfig, plan diff.Plan) error {
+// outsideTransactionDDL matches the statements Postgres refuses inside a transaction block.
+var outsideTransactionDDL = regexp.MustCompile(`(?i)^\s*(CREATE\s+(UNIQUE\s+)?INDEX|DROP\s+INDEX)\s+CONCURRENTLY\b`)
+
+func runPlan(ctx context.Context, cmd *cobra.Command, connConfig *pgx.ConnConfig, plan diff.Plan, statementHook string) error {
 	connPool, err := openDbWithPgxConfig(connConfig)
 	if err != nil {
 		return err
@@ -143,6 +161,13 @@ func runPlan(ctx context.Context, cmd *cobra.Command, connConfig *pgx.ConnConfig
 		cmdPrintln(cmd, header(fmt.Sprintf("Executing statement %d", getDisplayableStmtIdx(i))))
 		cmdPrintf(cmd, "%s\n\n", statementToPrettyS(stmt))
 		start := time.Now()
+		if statementHook != "" && !outsideTransactionDDL.MatchString(stmt.DDL) {
+			if err := runStatementWithHook(ctx, conn, stmt, statementHook); err != nil {
+				return err
+			}
+			cmdPrintf(cmd, "Finished executing statement. Duration: %s\n", time.Since(start))
+			continue
+		}
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION statement_timeout = %d", stmt.Timeout.Milliseconds())); err != nil {
 			return fmt.Errorf("setting statement timeout: %w", err)
 		}
@@ -152,10 +177,41 @@ func runPlan(ctx context.Context, cmd *cobra.Command, connConfig *pgx.ConnConfig
 		if _, err := conn.ExecContext(ctx, stmt.ToSQL()); err != nil {
 			return fmt.Errorf("executing migration statement. the database maybe be in a dirty state: %s: %w", stmt.DDL, err)
 		}
+		if statementHook != "" {
+			if _, err := conn.ExecContext(ctx, statementHook); err != nil {
+				return fmt.Errorf("running the statement hook after %s: %w", stmt.DDL, err)
+			}
+		}
 		cmdPrintf(cmd, "Finished executing statement. Duration: %s\n", time.Since(start))
 	}
 	cmdPrintln(cmd, header("Complete"))
 
+	return nil
+}
+
+// runStatementWithHook runs a statement and the hook in one transaction, so that the hook sees the statement's
+// effect and both commit or neither does. The timeouts are the transaction's own.
+func runStatementWithHook(ctx context.Context, conn *sql.Conn, stmt diff.Statement, statementHook string) error {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning the statement's transaction: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", stmt.Timeout.Milliseconds())); err != nil {
+		return fmt.Errorf("setting statement timeout: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL lock_timeout = %d", stmt.Timeout.Milliseconds())); err != nil {
+		return fmt.Errorf("setting lock timeout: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, stmt.ToSQL()); err != nil {
+		return fmt.Errorf("executing migration statement. the database maybe be in a dirty state: %s: %w", stmt.DDL, err)
+	}
+	if _, err := tx.ExecContext(ctx, statementHook); err != nil {
+		return fmt.Errorf("running the statement hook after %s: %w", stmt.DDL, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing migration statement: %s: %w", stmt.DDL, err)
+	}
 	return nil
 }
 

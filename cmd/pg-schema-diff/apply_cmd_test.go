@@ -1,6 +1,12 @@
 package main
 
 import (
+	"database/sql"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
 	"github.com/stripe/pg-schema-diff/internal/pgdump"
 	"github.com/stripe/pg-schema-diff/internal/pgengine"
 )
@@ -86,4 +92,87 @@ func (suite *cmdTestSuite) TestApplyCmd() {
 			suite.Equal(expectedDbDump, fromDbDump)
 		})
 	}
+}
+
+func (suite *cmdTestSuite) TestApplyCmdStatementHook() {
+	hookFile := func(sql string) dArgGenerator {
+		return func(t *testing.T) []string {
+			t.Helper()
+			path := filepath.Join(t.TempDir(), "hook.sql")
+			require.NoError(t, os.WriteFile(path, []byte(sql), 0644))
+			return []string{"--statement-hook-file", path}
+		}
+	}
+	const logHook = `INSERT INTO hook_log (ran_in_transaction, columns) SELECT
+		current_setting('transaction_isolation') IS NOT NULL AND txid_current_if_assigned() IS NOT NULL,
+		(SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.folders'::regclass AND attnum > 0 AND NOT attisdropped);`
+	fromDDL := []string{
+		"CREATE TABLE hook_log (ran_in_transaction BOOLEAN NOT NULL, columns BIGINT NOT NULL);",
+		"CREATE TABLE folders (id BIGINT PRIMARY KEY, name TEXT);",
+	}
+
+	suite.Run("the hook runs in each statement's transaction, after the statement", func() {
+		fromDb := tempDbWithSchema(suite.T(), suite.pgEngine, fromDDL)
+		suite.runCmdWithAssertions(runCmdWithAssertionsParams{
+			args: []string{"apply", "--skip-confirm-prompt", "--from-dsn", fromDb.GetDSN()},
+			dynamicArgs: []dArgGenerator{
+				tempSchemaDirDArg("to-dir", append(fromDDL[:1:1],
+					"CREATE TABLE folders (id BIGINT PRIMARY KEY, name TEXT, size BIGINT);")),
+				hookFile(logHook),
+			},
+		})
+		suite.Equal([][]any{{true, int64(3)}}, queryRows(suite.T(), fromDb, "SELECT ran_in_transaction, columns FROM hook_log"))
+	})
+
+	suite.Run("a hook that fails rolls its statement back", func() {
+		fromDb := tempDbWithSchema(suite.T(), suite.pgEngine, fromDDL)
+		suite.runCmdWithAssertions(runCmdWithAssertionsParams{
+			args: []string{"apply", "--skip-confirm-prompt", "--from-dsn", fromDb.GetDSN()},
+			dynamicArgs: []dArgGenerator{
+				tempSchemaDirDArg("to-dir", append(fromDDL[:1:1],
+					"CREATE TABLE folders (id BIGINT PRIMARY KEY, name TEXT, size BIGINT);")),
+				hookFile("DO $$ BEGIN RAISE EXCEPTION 'hook refused'; END $$;"),
+			},
+			expectErrContains: []string{"hook refused"},
+		})
+		suite.Equal([][]any{{int64(2)}}, queryRows(suite.T(), fromDb,
+			"SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.folders'::regclass AND attnum > 0 AND NOT attisdropped"))
+	})
+
+	suite.Run("the hook runs straight after a statement that cannot run in a transaction", func() {
+		fromDb := tempDbWithSchema(suite.T(), suite.pgEngine, fromDDL)
+		suite.runCmdWithAssertions(runCmdWithAssertionsParams{
+			args: []string{"apply", "--skip-confirm-prompt", "--allow-hazards", "INDEX_BUILD", "--from-dsn", fromDb.GetDSN()},
+			dynamicArgs: []dArgGenerator{
+				tempSchemaDirDArg("to-dir", append(fromDDL,
+					"CREATE INDEX folders_name ON folders (name);")),
+				hookFile(logHook),
+			},
+		})
+		suite.Equal([][]any{{false, int64(2)}}, queryRows(suite.T(), fromDb, "SELECT ran_in_transaction, columns FROM hook_log"))
+	})
+}
+
+func queryRows(t *testing.T, db *pgengine.DB, query string) [][]any {
+	t.Helper()
+	pool, err := sql.Open("pgx", db.GetDSN())
+	require.NoError(t, err)
+	defer pool.Close()
+	rows, err := pool.Query(query)
+	require.NoError(t, err)
+	defer rows.Close()
+	columns, err := rows.Columns()
+	require.NoError(t, err)
+	var all [][]any
+	for rows.Next() {
+		row := make([]any, len(columns))
+		pointers := make([]any, len(columns))
+		for i := range row {
+			pointers[i] = &row[i]
+		}
+		require.NoError(t, rows.Scan(pointers...))
+		all = append(all, row)
+	}
+	require.NoError(t, rows.Err())
+	return all
 }
