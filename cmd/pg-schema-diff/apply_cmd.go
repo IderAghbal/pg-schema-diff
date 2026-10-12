@@ -43,6 +43,8 @@ func buildApplyCmd() *cobra.Command {
 
 	connFlags := createConnectionFlags(cmd, "from-", " The database to migrate")
 	toSchemaFlags := createSchemaSourceFlags(cmd, "to-")
+	tempDbConnFlags := createConnectionFlags(cmd, "temp-db-", "The server that holds the temporary databases planning creates, "+
+		"through its root database. Unset, they are created on the server of the database to migrate.")
 	planOptsFlags := createPlanOptionsFlags(cmd)
 	allowedHazardsTypesStrs := cmd.Flags().StringSlice("allow-hazards", nil,
 		"Specify the hazards that are allowed. Order does not matter, and duplicates are ignored. If the"+
@@ -72,6 +74,10 @@ func buildApplyCmd() *cobra.Command {
 			return err
 		}
 		fromSchema := dsnSchemaSource(connConfig)
+		tempDbConnConfig, err := applyTempDbConnConfig(tempDbConnFlags, connConfig)
+		if err != nil {
+			return err
+		}
 
 		toSchema, err := parseSchemaSource(*toSchemaFlags)
 		if err != nil {
@@ -97,7 +103,7 @@ func buildApplyCmd() *cobra.Command {
 		plan, err := generatePlan(cmd.Context(), generatePlanParameters{
 			fromSchema:       fromSchema,
 			toSchema:         toSchema,
-			tempDbConnConfig: connConfig,
+			tempDbConnConfig: tempDbConnConfig,
 			planOptions:      planOptions,
 			logger:           logger,
 		})
@@ -323,4 +329,13 @@ func getHazardTypes(plan diff.Plan) []diff.MigrationHazardType {
 
 func getDisplayableStmtIdx(i int) int {
 	return i + 1
+}
+
+// applyTempDbConnConfig is the server apply plans its temporary databases on: the one --temp-db-dsn names, or else the
+// server of the database to migrate.
+func applyTempDbConnConfig(tempDbConnFlags *connectionFlags, migrated *pgx.ConnConfig) (*pgx.ConnConfig, error) {
+	if !tempDbConnFlags.IsSet() {
+		return migrated, nil
+	}
+	return parseConnectionFlags(tempDbConnFlags)
 }
