@@ -10,6 +10,7 @@ import (
 // openDbWithPgxConfig opens a database connection using the provided pgx.ConnConfig and pings it
 func openDbWithPgxConfig(config *pgx.ConnConfig) (*sql.DB, error) {
 	connPool := stdlib.OpenDB(*config)
+	capConnections(connPool)
 	if err := connPool.Ping(); err != nil {
 		connPool.Close()
 		return nil, err

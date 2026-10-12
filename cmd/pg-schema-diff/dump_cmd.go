@@ -75,7 +75,7 @@ func generateDump(ctx context.Context, params generateDumpParams) (diff.Plan, er
 		return diff.Plan{}, fmt.Errorf("opening database connection: %w", err)
 	}
 	defer connPool.Close()
-	connPool.SetMaxOpenConns(defaultMaxConnections)
+	connPool.SetMaxOpenConns(maxOpenConnections(defaultMaxConnections))
 
 	tempDbFactory, err := tempdb.NewOnInstanceFactory(ctx, func(ctx context.Context, dbName string) (*sql.DB, error) {
 		cfg := params.connConfig.Copy()

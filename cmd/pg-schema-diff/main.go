@@ -15,6 +15,7 @@ func buildRootCmd() *cobra.Command {
 	rootCmd.AddCommand(buildApplyCmd())
 	rootCmd.AddCommand(buildDumpCmd())
 	rootCmd.AddCommand(buildVersionCmd())
+	addMaxConnectionsFlag(rootCmd)
 	return rootCmd
 }
 
