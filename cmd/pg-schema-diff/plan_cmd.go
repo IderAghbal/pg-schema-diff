@@ -309,7 +309,7 @@ func dsnSchemaSource(connConfig *pgx.ConnConfig) schemaSourceFactory {
 		if err != nil {
 			return nil, nil, fmt.Errorf("opening db with pgx config: %w", err)
 		}
-		connPool.SetMaxOpenConns(defaultMaxConnections)
+		connPool.SetMaxOpenConns(maxOpenConnections(defaultMaxConnections))
 		return diff.DBSchemaSource(connPool), connPool, nil
 	}
 }
